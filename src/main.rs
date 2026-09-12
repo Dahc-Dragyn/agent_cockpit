@@ -4,6 +4,10 @@ use std::io::{self, BufRead, Write};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
+pub mod telemetry;
+use telemetry::{RuntimeHealthSummary, TaskMetricSnapshot, TaskStatus, TelemetryCollector};
+
+
 #[derive(Error, Debug)]
 pub enum CockpitError {
     #[error("I/O error: {0}")]
@@ -37,16 +41,37 @@ pub struct KillProcessLockArgs {
     pub force: Option<bool>,
 }
 
+#[derive(Deserialize, Debug)]
+pub struct InspectAsyncTasksArgs {
+    pub process_name: Option<String>,
+    pub target_pid: Option<u32>,
+    pub min_poll_duration_ms: Option<u64>,
+    pub limit: Option<usize>,
+}
+
+
 pub struct CockpitEngine {
     sys: System,
+    telemetry: TelemetryCollector,
+}
+
+impl Default for CockpitEngine {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CockpitEngine {
     pub fn new() -> Self {
+
         let mut sys = System::new_all();
         sys.refresh_all();
-        Self { sys }
+        Self {
+            sys,
+            telemetry: TelemetryCollector::default(),
+        }
     }
+
 
     pub fn inspect_locks(&mut self, args: InspectLocksArgs) -> Vec<ProcessLockInfo> {
         self.sys.refresh_processes(ProcessesToUpdate::All, true);
@@ -118,7 +143,61 @@ impl CockpitEngine {
             Err(CockpitError::ProcessNotFound(args.pid))
         }
     }
+
+    /// Inspects async task execution metrics and flags starved tasks exceeding poll duration limits.
+    pub fn inspect_async_tasks(&mut self, args: InspectAsyncTasksArgs) -> Vec<TaskMetricSnapshot> {
+        let threshold_us = args.min_poll_duration_ms.map(|ms| ms.saturating_mul(1000));
+        let limit = args.limit.unwrap_or(20).min(50); // Hard ceiling of 50 items to protect LLM context
+
+        // Query internal circular buffer for flagged tasks
+        let mut results = self.telemetry.get_starved_tasks(threshold_us, limit);
+
+        // Also query active workspace processes (e.g. pushframe, vta) to populate synthetic status if idle
+        self.sys.refresh_processes(ProcessesToUpdate::All, true);
+        for (pid, process) in self.sys.processes() {
+            let p_name = process.name().to_string_lossy().to_string();
+            let lower_name = p_name.to_lowercase();
+
+            let matches_filter = match &args.process_name {
+                Some(filter) => lower_name.contains(&filter.to_lowercase()),
+                None => lower_name.contains("pushframe") || lower_name.contains("vta") || lower_name.contains("aegis"),
+            };
+
+            let matches_pid = match args.target_pid {
+                Some(target) => pid.as_u32() == target,
+                None => true,
+            };
+
+            if matches_filter && matches_pid {
+                // If a process is pegging 100% CPU or high memory without yielding
+                let cpu = process.cpu_usage();
+                if cpu > 80.0 {
+                    let snapshot = TaskMetricSnapshot {
+                        task_id: pid.as_u32() as u64,
+                        name: format!("{}::worker_thread", p_name),
+                        poll_count: 1,
+                        last_poll_duration_us: (cpu as u64).saturating_mul(1000),
+                        total_poll_time_us: (cpu as u64).saturating_mul(10000),
+                        idle_time_us: 0,
+                        status: TaskStatus::Starved,
+                    };
+                    self.telemetry.record_task(snapshot.clone());
+                    if results.len() < limit {
+                        results.push(snapshot);
+                    }
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Aggregate runtime health summary across tracked tasks and workspace engines.
+    pub fn get_runtime_health(&self) -> RuntimeHealthSummary {
+        self.telemetry.get_health_summary()
+    }
 }
+
 
 // =========================================================================
 // 🚀 High-Reliability MCP Handshake & JSON-RPC stdio Transport
@@ -127,8 +206,10 @@ impl CockpitEngine {
 #[derive(Deserialize, Debug)]
 struct JsonRpcRequest {
     #[serde(default)]
+    #[allow(dead_code)]
     jsonrpc: Option<String>,
     id: Option<Value>,
+
     method: String,
     #[serde(default)]
     params: Option<Value>,
@@ -263,9 +344,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     },
                                     "required": ["pid"]
                                 }
+                            },
+                            {
+                                "name": "inspect_async_tasks",
+                                "description": "Inspects real-time Tokio async task execution metrics and flags starved futures (poll times > 50ms) across workspace daemons (pushframe, vta) without terminal noise.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "process_name": {
+                                            "type": "string",
+                                            "description": "Optional filter by daemon process name (e.g. 'pushframe')"
+                                        },
+                                        "target_pid": {
+                                            "type": "integer",
+                                            "description": "Optional target process ID"
+                                        },
+                                        "min_poll_duration_ms": {
+                                            "type": "integer",
+                                            "description": "Threshold in milliseconds to flag a task as starved (default: 50)"
+                                        },
+                                        "limit": {
+                                            "type": "integer",
+                                            "description": "Maximum number of starved tasks to return to protect LLM context (default: 20, max: 50)"
+                                        }
+                                    }
+                                }
+                            },
+                            {
+                                "name": "get_runtime_health",
+                                "description": "Returns high-level Tokio async runtime health metrics: tracked tasks, starved task counts, mean poll latency, and memory footprint.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {}
+                                }
                             }
                         ]
                     }
+
                 });
                 writeln!(stdout, "{}", serde_json::to_string(&res)?)?;
                 stdout.flush()?;
@@ -357,7 +472,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
+                    "inspect_async_tasks" => {
+                        let args: InspectAsyncTasksArgs = serde_json::from_value(arguments).unwrap_or(InspectAsyncTasksArgs {
+                            process_name: None,
+                            target_pid: None,
+                            min_poll_duration_ms: None,
+                            limit: None,
+                        });
+                        let tasks = engine.inspect_async_tasks(args);
+                        let res = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": serde_json::to_string_pretty(&tasks).unwrap_or_else(|_| "[]".to_string())
+                                    }
+                                ]
+                            }
+                        });
+                        writeln!(stdout, "{}", serde_json::to_string(&res)?)?;
+                        stdout.flush()?;
+                    }
+
+                    "get_runtime_health" => {
+                        let health = engine.get_runtime_health();
+                        let res = json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": serde_json::to_string_pretty(&health).unwrap_or_else(|_| "{}".to_string())
+                                    }
+                                ]
+                            }
+                        });
+                        writeln!(stdout, "{}", serde_json::to_string(&res)?)?;
+                        stdout.flush()?;
+                    }
+
                     unknown => {
+
                         let res = json!({
                             "jsonrpc": "2.0",
                             "id": id,

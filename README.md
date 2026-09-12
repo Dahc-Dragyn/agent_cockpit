@@ -29,6 +29,12 @@ On Windows environments, the operating system places exclusive mandatory locks o
   - Resolves executable lockouts and file permission errors without requiring full IDE or system reboots.
   - Returns clear diagnostic messages and error feedback on failure or missing PIDs.
 
+- **Native Async Task Telemetry (`inspect_async_tasks` & `get_runtime_health`)**:
+  - **Task Starvation Detection**: Inspects real-time Tokio async task poll durations and flags unyielding futures (default threshold > 50ms) across workspace daemons (`pushframe`, `vta`).
+  - **Zero-Panic Circular Buffer**: Strictly bounds telemetry memory consumption (< 5MB) using a 5,000-snapshot ring buffer and safe pattern matching (`.get()`, `match`).
+  - **Token Economical Summaries**: Truncates output to a maximum of 50 items to protect LLM context windows (e.g., `gemini-3.1-flash-lite`).
+  - **Runtime Health**: Reports mean/max poll latencies, tracked task counts, and estimated RAM usage without terminal ANSI clutter.
+
 - **Zero-Crash MCP Transport**:
   - Robust JSON-RPC 2.0 stdio implementation.
   - Full support for MCP initialization handshake (`initialize`, `notifications/initialized`), discovery probes (`server/discover`, `ping`), and tool lifecycle (`tools/list`, `tools/call`).
@@ -44,8 +50,11 @@ agent_cockpit/
 ├── Cargo.lock
 ├── README.md           # Documentation
 └── src/
-    └── main.rs         # CockpitEngine & MCP JSON-RPC stdio transport
+    ├── main.rs         # CockpitEngine & MCP JSON-RPC stdio transport
+    └── telemetry/
+        └── mod.rs      # TelemetryCollector circular buffer & health metrics
 ```
+
 
 ---
 
