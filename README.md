@@ -126,8 +126,49 @@ Terminates a specific process by PID to clear filesystem locks.
 Successfully terminated process 'target_worker.exe' (PID 12345)
 ```
 
+### 3. `inspect_async_tasks` (New in v0.2.0)
+Inspects real-time Tokio asynchronous task execution metrics and flags unyielding futures or task starvation across workspace daemons (`pushframe`, `vta`, `aegis`).
+
+**Parameters:**
+- `process_name` *(string, optional)*: Filter by daemon process name (e.g., `"pushframe"`).
+- `target_pid` *(integer, optional)*: Specific process ID to inspect.
+- `min_poll_duration_ms` *(integer, optional)*: Threshold in milliseconds to flag a future as starved (default: `50`).
+- `limit` *(integer, optional)*: Maximum items to return to protect LLM context windows (default: `20`, max: `50`).
+
+**Example Output:**
+```json
+[
+  {
+    "task_id": 3,
+    "name": "pushframe::render_frame_block",
+    "poll_count": 1,
+    "last_poll_duration_us": 75000,
+    "total_poll_time_us": 75000,
+    "idle_time_us": 0,
+    "status": "Starved"
+  }
+]
+```
+
+### 4. `get_runtime_health` (New in v0.2.0)
+Returns high-level aggregate Tokio runtime health metrics across all tracked asynchronous tasks.
+
+**Parameters:** None.
+
+**Example Output:**
+```json
+{
+  "total_tracked_tasks": 128,
+  "starved_tasks_count": 1,
+  "mean_poll_duration_us": 420,
+  "max_poll_duration_us": 75000,
+  "estimated_memory_kb": 15
+}
+```
+
 ---
 
 ## 🛡️ License
 
 Internal utility for workspace process management and reliability.
+
